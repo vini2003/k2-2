@@ -3,10 +3,13 @@ use crate::protocol::*;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
@@ -65,6 +68,16 @@ async fn handle_client(socket: tokio::net::TcpStream, cfg: HostConfig) -> Result
             }
             ClientMessage::RequestDownload { entries, mode } => {
                 handle_download(&cfg, entries, mode, &mut framed).await?;
+            }
+            ClientMessage::RequestDownloadParallel { entries, mode, streams: _ } => {
+                handle_download_parallel(&cfg, entries, mode, &mut framed).await?;
+            }
+            ClientMessage::RangeRequest { transfer_id, offset, len } => {
+                stream_range(transfer_id, offset, len, &mut framed).await?;
+            }
+            ClientMessage::ReleaseTransfer { transfer_id } => {
+                release_transfer(&transfer_id);
+                send_message(&mut framed, ServerMessage::Done).await?;
             }
             ClientMessage::Ping => {
                 // no-op
@@ -321,6 +334,104 @@ impl DownloadJob {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct StoredTransfer {
+    path: PathBuf,
+    size: u64,
+    label: String,
+    tmp: Option<std::sync::Arc<tempfile::TempPath>>,
+}
+
+static TRANSFERS: Lazy<Mutex<HashMap<String, StoredTransfer>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn register_transfer(built: BuiltDownload) -> (String, u64, String) {
+    let id = format!("{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tmp_arc = built.tmp.map(|t| std::sync::Arc::new(t.into_temp_path()));
+    let size = built.size;
+    let label = built.label.clone();
+    TRANSFERS.lock().insert(
+        id.clone(),
+        StoredTransfer {
+            path: built.path,
+            size,
+            label: built.label,
+            tmp: tmp_arc,
+        },
+    );
+    (id, size, label)
+}
+
+fn release_transfer(id: &str) {
+    TRANSFERS.lock().remove(id);
+}
+
+async fn stream_range(
+    transfer_id: String,
+    offset: u64,
+    len: u64,
+    framed: &mut Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
+) -> Result<()> {
+    let stored = {
+        let guard = TRANSFERS.lock();
+        guard
+            .get(&transfer_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown transfer id"))?
+    };
+    let mut file = File::open(&stored.path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    let mut buf = vec![0u8; CHUNK];
+    let mut current = offset;
+    while remaining > 0 {
+        let to_read = remaining.min(CHUNK as u64) as usize;
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        remaining -= n as u64;
+        send_message(
+            framed,
+            ServerMessage::RangeChunk {
+                offset: current,
+                data: Bytes::copy_from_slice(&buf[..n]),
+            },
+        )
+        .await?;
+        current += n as u64;
+    }
+    send_message(framed, ServerMessage::Done).await?;
+    Ok(())
+}
+
+async fn handle_download_parallel(
+    cfg: &HostConfig,
+    entries: Vec<RemoteEntry>,
+    mode: DownloadMode,
+    framed: &mut Framed<tokio::net::TcpStream, LengthDelimitedCodec>,
+) -> Result<()> {
+    if entries.is_empty() {
+        send_message(framed, ServerMessage::Error("no entries provided".into())).await?;
+        return Ok(());
+    }
+    let job = DownloadJob::build(cfg, &entries, mode.clone())?;
+    let built = spawn_blocking(move || job.materialize(mpsc::unbounded_channel().0))
+        .await??;
+    let (id, size, label) = register_transfer(built);
+    send_message(
+        framed,
+        ServerMessage::TransferReady {
+            transfer_id: id,
+            size,
+            label,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn list_entries(cfg: &HostConfig, kind: ListKind) -> Result<Vec<RemoteEntry>> {

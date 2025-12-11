@@ -27,6 +27,7 @@ pub async fn run_tui(
     token_file: PathBuf,
     output_dir: PathBuf,
     servers: std::collections::HashMap<String, crate::config::HostConfig>,
+    streams: u32,
 ) -> Result<()> {
     let token = fs::read_to_string(&token_file)
         .with_context(|| format!("reading token {}", token_file.display()))?;
@@ -46,7 +47,7 @@ pub async fn run_tui(
         guard.list(ListKind::Schematics).await?
     };
 
-    let mut app = App::new(server_name, addr, output_dir, worlds, schematics, servers);
+    let mut app = App::new(server_name, addr, output_dir, worlds, schematics, servers, streams);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
@@ -115,12 +116,13 @@ pub async fn run_tui(
                     let target = app.build_target_path(&entries, mode.clone());
                     let target_for_task = target.clone();
                     let progress = progress_tx.clone();
+                    let streams = app.streams;
                     let stats = stats_tx.clone();
                     let client = client.clone();
                     inflight = Some(tokio::spawn(async move {
                         let res = {
                             let mut guard = client.lock().await;
-                            guard.download(entries, mode, &target_for_task, progress.clone(), stats.clone()).await
+                            guard.download(entries, mode, &target_for_task, progress.clone(), stats.clone(), streams).await
                         };
                         if let Err(err) = res {
                             let _ = progress.send(ProgressUpdate{
@@ -179,6 +181,7 @@ struct App {
     servers: HashMap<String, crate::config::HostConfig>,
     pending_switch: Option<String>,
     last_stats: Option<TransferStats>,
+    streams: u32,
 }
 
 struct PendingAction {
@@ -194,6 +197,7 @@ impl App {
         worlds: Vec<RemoteEntry>,
         schematics: Vec<RemoteEntry>,
         servers: HashMap<String, crate::config::HostConfig>,
+        streams: u32,
     ) -> Self {
         let mut app = Self {
             server_name,
@@ -214,6 +218,7 @@ impl App {
             servers,
             pending_switch: None,
             last_stats: None,
+            streams,
         };
         app.apply_filter();
         app

@@ -38,6 +38,19 @@ pub enum ClientMessage {
         entries: Vec<RemoteEntry>,
         mode: DownloadMode,
     },
+    RequestDownloadParallel {
+        entries: Vec<RemoteEntry>,
+        mode: DownloadMode,
+        streams: u32,
+    },
+    RangeRequest {
+        transfer_id: String,
+        offset: u64,
+        len: u64,
+    },
+    ReleaseTransfer {
+        transfer_id: String,
+    },
     Ping,
 }
 
@@ -74,6 +87,15 @@ pub enum ServerMessage {
         max_read_ms: u128,
         max_send_ms: u128,
         chunks: u64,
+    },
+    TransferReady {
+        transfer_id: String,
+        size: u64,
+        label: String,
+    },
+    RangeChunk {
+        offset: u64,
+        data: Bytes,
     },
     Done,
 }

@@ -42,6 +42,9 @@ enum Commands {
         /// Directory to write downloads
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Number of parallel streams
+        #[arg(long, default_value_t = 4)]
+        streams: u32,
     },
     /// Alias for client; reads config and drops into UI
     Ui {
@@ -57,6 +60,9 @@ enum Commands {
         /// Directory to write downloads
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Number of parallel streams
+        #[arg(long, default_value_t = 4)]
+        streams: u32,
     },
 }
 
@@ -74,11 +80,11 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("server `{name}` missing from config"))?;
             server::run_server(&name, host).await?;
         }
-        Commands::Client { server, addr, token, output } => {
-            run_client(&cfg, server, addr, token, output).await?;
+        Commands::Client { server, addr, token, output, streams } => {
+            run_client(&cfg, server, addr, token, output, streams).await?;
         }
-        Commands::Ui { server, addr, token, output } => {
-            run_client(&cfg, server, addr, token, output).await?;
+        Commands::Ui { server, addr, token, output, streams } => {
+            run_client(&cfg, server, addr, token, output, streams).await?;
         }
     }
 
@@ -91,6 +97,7 @@ async fn run_client(
     addr: Option<String>,
     token: Option<PathBuf>,
     output: Option<PathBuf>,
+    streams: u32,
 ) -> Result<()> {
     let target_name = server
         .or_else(|| cfg.client.as_ref().and_then(|c| c.default_server.clone()))
@@ -119,6 +126,6 @@ async fn run_client(
         .or_else(|| cfg.client.as_ref().and_then(|c| c.output_dir.clone()))
         .unwrap_or_else(|| PathBuf::from("downloads"));
 
-    tui::run_tui(name, addr, token, output_dir, cfg.servers.clone()).await?;
+    tui::run_tui(name, addr, token, output_dir, cfg.servers.clone(), streams).await?;
     Ok(())
 }
