@@ -644,17 +644,12 @@ fn zip_entries(
 ) -> Result<()> {
     let file = File::create(output)?;
     let mut writer = zip::ZipWriter::new(file);
-    let options_store = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let options_deflate = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut done = 0u64;
     let mut buffer = vec![0u8; CHUNK];
     for entry in entries {
-        let opts = if entry.archive_path.ends_with(".schematic") || entry.archive_path.ends_with(".schem") {
-            options_deflate
-        } else {
-            options_store
-        };
+        let opts = options_deflate;
         if entry.is_dir {
             writer.add_directory(entry.archive_path.clone(), opts)?;
             continue;
