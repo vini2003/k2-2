@@ -130,13 +130,31 @@ async fn handle_download(
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
     let send_start = std::time::Instant::now();
+    let mut read_total = 0u128;
+    let mut send_total = 0u128;
+    let mut read_max = 0u128;
+    let mut send_max = 0u128;
+    let mut chunks = 0u64;
     loop {
+        let t0 = std::time::Instant::now();
         let n = file.read(&mut buf)?;
+        let read_ms = t0.elapsed().as_millis();
+        read_total += read_ms;
+        if read_ms > read_max {
+            read_max = read_ms;
+        }
         if n == 0 {
             break;
         }
         sent += n as u64;
+        let t1 = std::time::Instant::now();
         send_message(framed, ServerMessage::DataChunk(Bytes::copy_from_slice(&buf[..n]))).await?;
+        let send_ms = t1.elapsed().as_millis();
+        send_total += send_ms;
+        if send_ms > send_max {
+            send_max = send_ms;
+        }
+        chunks += 1;
         if sent % (CHUNK as u64) == 0 || sent == built.size {
             send_message(
                 framed,
@@ -168,13 +186,22 @@ async fn handle_download(
         framed,
         ServerMessage::Stats {
             zip_ms,
-            send_ms,
+            send_wall_ms: send_ms,
             bytes: built.size,
             avg_mb_s: mbps,
+            read_ms: read_total,
+            send_ms: send_total,
+            max_read_ms: read_max,
+            max_send_ms: send_max,
+            chunks,
         },
     )
     .await
     .ok();
+    println!(
+        "[stats] {} bytes zip={}ms send_wall={}ms read_total={}ms send_total={}ms max_read={}ms max_send={}ms chunks={} avg={:.2} MB/s",
+        built.size, zip_ms, send_ms, read_total, send_total, read_max, send_max, chunks, mbps
+    );
     send_message(framed, ServerMessage::Done).await?;
     built.cleanup();
     Ok(())

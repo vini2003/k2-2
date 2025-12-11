@@ -362,13 +362,27 @@ fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
 
     let mut info_lines = vec![Line::from(format!("Status: {}", app.status))];
     if let Some(stats) = &app.last_stats {
+        let origin = match stats.origin {
+            crate::client::StatsOrigin::Server => "server",
+            crate::client::StatsOrigin::Client => "client",
+        };
         info_lines.push(Line::from(format!(
-            "Last: {:.2} MB/s | {} | zip: {} ms | send: {} ms",
+            "Last ({origin}): {:.2} MB/s | {} | zip: {} ms | send_wall: {} ms",
             stats.avg_mb_s,
             format_size(stats.bytes),
             stats.zip_ms,
-            stats.send_ms
+            stats.send_wall_ms,
         )));
+        if stats.origin == crate::client::StatsOrigin::Server {
+            info_lines.push(Line::from(format!(
+                "    read_total: {} ms (max {} ms) | send_total: {} ms (max {} ms) | chunks: {}",
+                stats.read_ms,
+                stats.max_read_ms,
+                stats.send_ms,
+                stats.max_send_ms,
+                stats.chunks
+            )));
+        }
     }
     let mut gauge = None;
     if let Some(p) = &app.progress {

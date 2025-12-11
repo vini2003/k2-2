@@ -66,9 +66,14 @@ pub enum ServerMessage {
     DataChunk(Bytes),
     Stats {
         zip_ms: u128,
-        send_ms: u128,
+        send_wall_ms: u128,
         bytes: u64,
         avg_mb_s: f64,
+        read_ms: u128,
+        send_ms: u128,
+        max_read_ms: u128,
+        max_send_ms: u128,
+        chunks: u64,
     },
     Done,
 }
