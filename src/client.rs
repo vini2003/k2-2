@@ -60,6 +60,10 @@ impl RemoteClient {
     ) -> Result<()> {
         let started = Instant::now();
         let mut received = 0u64;
+        let mut write_total = 0u128;
+        let mut write_max = 0u128;
+        let mut gap_max = 0u128;
+        let mut last_frame = Instant::now();
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).await.ok();
         }
@@ -75,13 +79,25 @@ impl RemoteClient {
 
         while let Some(frame) = self.framed.next().await.transpose()? {
             let msg: ServerMessage = bincode::deserialize(&frame)?;
+            let now = Instant::now();
+            let gap = now.duration_since(last_frame).as_millis();
+            if gap > gap_max {
+                gap_max = gap;
+            }
+            last_frame = now;
             match msg {
                 ServerMessage::Progress(p) => {
                     let _ = progress_tx.send(p);
                 }
                 ServerMessage::DataChunk(chunk) => {
+                    let t0 = Instant::now();
                     file.write_all(&chunk).await?;
                     received += chunk.len() as u64;
+                    let w = t0.elapsed().as_millis();
+                    write_total += w;
+                    if w > write_max {
+                        write_max = w;
+                    }
                 }
                 ServerMessage::Stats { zip_ms, send_wall_ms, bytes, avg_mb_s, read_ms, send_ms, max_read_ms, max_send_ms, chunks } => {
                     let _ = stats_tx.send(TransferStats {
@@ -95,6 +111,9 @@ impl RemoteClient {
                         max_send_ms,
                         chunks,
                         origin: StatsOrigin::Server,
+                        client_write_ms: 0,
+                        client_max_write_ms: 0,
+                        client_gap_max_ms: 0,
                     });
                 }
                 ServerMessage::Done => break,
@@ -118,6 +137,9 @@ impl RemoteClient {
                 max_send_ms: 0,
                 chunks: 0,
                 origin: StatsOrigin::Client,
+                client_write_ms: write_total,
+                client_max_write_ms: write_max,
+                client_gap_max_ms: gap_max,
             });
         }
 
@@ -149,4 +171,7 @@ pub struct TransferStats {
     pub max_send_ms: u128,
     pub chunks: u64,
     pub origin: StatsOrigin,
+    pub client_write_ms: u128,
+    pub client_max_write_ms: u128,
+    pub client_gap_max_ms: u128,
 }

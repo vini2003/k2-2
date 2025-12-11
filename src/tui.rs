@@ -382,6 +382,13 @@ fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
                 stats.max_send_ms,
                 stats.chunks
             )));
+        } else {
+            info_lines.push(Line::from(format!(
+                "    write_total: {} ms (max {} ms) | gap_max: {} ms",
+                stats.client_write_ms,
+                stats.client_max_write_ms,
+                stats.client_gap_max_ms
+            )));
         }
     }
     let mut gauge = None;
