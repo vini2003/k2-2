@@ -43,7 +43,7 @@ enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
         /// Number of parallel streams
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 16)]
         streams: u32,
     },
     /// Alias for client; reads config and drops into UI
@@ -61,7 +61,7 @@ enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
         /// Number of parallel streams
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 16)]
         streams: u32,
     },
 }

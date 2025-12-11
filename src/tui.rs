@@ -196,13 +196,13 @@ impl App {
         output_dir: PathBuf,
         worlds: Vec<RemoteEntry>,
         schematics: Vec<RemoteEntry>,
-        servers: HashMap<String, crate::config::HostConfig>,
-        streams: u32,
-    ) -> Self {
-        let mut app = Self {
-            server_name,
-            addr,
-            output_dir,
+            servers: HashMap<String, crate::config::HostConfig>,
+            streams: u32,
+        ) -> Self {
+            let mut app = Self {
+                server_name,
+                addr,
+                output_dir,
             current: ListKind::Worlds,
             worlds,
             schematics,
