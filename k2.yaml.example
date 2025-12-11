@@ -1,0 +1,20 @@
+servers:
+  build-server:
+    listen: "0.0.0.0:5757"
+    token_file: "/opt/servers/build/token.txt"
+    worlds:
+      - "/opt/servers/build/worlds/"
+    schematics:
+      - "/opt/servers/build/plugins/FastAsyncWorldEdit/schematics/"
+  backup:
+    listen: "0.0.0.0:5758"
+    token_file: "/opt/servers/backup/token.txt"
+    worlds:
+      - "/opt/servers/backup/worlds/"
+    schematics:
+      - "/opt/servers/backup/plugins/FastAsyncWorldEdit/schematics/"
+
+client:
+  default_server: "build-server"
+  token_file: "C:/Users/you/.k2/token.txt"
+  output_dir: "downloads"

@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+
+# Cargo
+**/Cargo.lock
+
+# Local artifacts
+/downloads
+/k2.yaml
+/k2.yaml.local
+/docker-compose.yml
+/token.txt
+/src.zip
+
+# IDE/editor
+.idea/
+.vscode/
