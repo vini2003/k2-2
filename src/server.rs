@@ -161,7 +161,6 @@ async fn handle_download(
         }),
     )
     .await?;
-    send_message(framed, ServerMessage::Done).await?;
     let send_ms = send_start.elapsed().as_millis();
     let secs = (send_ms as f64 / 1000.0).max(0.001);
     let mbps = (built.size as f64 / (1024.0 * 1024.0)) / secs;
@@ -176,6 +175,7 @@ async fn handle_download(
     )
     .await
     .ok();
+    send_message(framed, ServerMessage::Done).await?;
     built.cleanup();
     Ok(())
 }
