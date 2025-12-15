@@ -254,8 +254,10 @@ impl RemoteClient {
             let done = done_bytes.clone();
             let progress = progress_tx.clone();
             let client = self.connect_fresh().await?;
+            let stream_id = i;
             let handle = tokio::spawn(async move {
-                download_range(
+                let timeout = std::time::Duration::from_secs(300); // 5 min timeout per stream
+                match tokio::time::timeout(timeout, download_range(
                     client,
                     tid_clone,
                     start,
@@ -264,15 +266,45 @@ impl RemoteClient {
                     done,
                     progress,
                     size,
-                )
-                .await
+                    stream_id,
+                )).await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!("stream {} timed out after 5 minutes", stream_id)),
+                }
             });
             handles.push(handle);
         }
 
-        for h in handles {
-            h.await??;
+        let mut first_error = None;
+        for (idx, h) in handles.into_iter().enumerate() {
+            match h.await {
+                Ok(Ok(())) => {}, // Success
+                Ok(Err(e)) => {
+                    eprintln!("Stream {} failed: {:?}", idx, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Stream {} task panicked: {:?}", idx, e);
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!("stream {} task panicked", idx));
+                    }
+                }
+            }
         }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        // Send completion progress update
+        let _ = progress_tx.send(ProgressUpdate {
+            phase: ProgressPhase::Completed,
+            done: size,
+            total: size,
+            label: "parallel".into(),
+        });
 
         // release transfer
         send(
@@ -335,29 +367,46 @@ async fn download_range(
     done: std::sync::Arc<std::sync::atomic::AtomicU64>,
     progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
     total: u64,
+    stream_id: u32,
 ) -> Result<()> {
     send(
         &mut client.framed,
         ClientMessage::RangeRequest {
-            transfer_id,
+            transfer_id: transfer_id.clone(),
             offset,
             len,
         },
     )
-    .await?;
+    .await
+    .with_context(|| format!("stream {}: sending range request", stream_id))?;
 
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(target_path)
         .await
-        .with_context(|| format!("opening {}", target_path.display()))?;
+        .with_context(|| format!("stream {}: opening {}", stream_id, target_path.display()))?;
 
-    while let Some(frame) = client.framed.next().await.transpose()? {
-        let msg: ServerMessage = bincode::deserialize(&frame)?;
+    let mut received = 0u64;
+    let read_timeout = std::time::Duration::from_secs(30); // 30s timeout per chunk
+
+    loop {
+        let frame_result = tokio::time::timeout(read_timeout, client.framed.next()).await;
+
+        let frame = match frame_result {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => return Err(anyhow!("stream {}: frame error: {:?}", stream_id, e)),
+            Ok(None) => return Err(anyhow!("stream {}: connection closed unexpectedly after {} bytes", stream_id, received)),
+            Err(_) => return Err(anyhow!("stream {}: timeout waiting for data after {} bytes (expected {} total)", stream_id, received, len)),
+        };
+
+        let msg: ServerMessage = bincode::deserialize(&frame)
+            .with_context(|| format!("stream {}: deserializing message", stream_id))?;
+
         match msg {
             ServerMessage::RangeChunk { offset: chunk_off, data } => {
                 file.seek(std::io::SeekFrom::Start(chunk_off)).await?;
                 file.write_all(&data).await?;
+                received += data.len() as u64;
                 let new_done = done.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed)
                     + data.len() as u64;
                 let _ = progress_tx.send(ProgressUpdate {
@@ -367,8 +416,11 @@ async fn download_range(
                     label: "parallel".into(),
                 });
             }
-            ServerMessage::Done => break,
-            ServerMessage::Error(e) => return Err(anyhow!(e)),
+            ServerMessage::Done => {
+                file.flush().await?;
+                break;
+            },
+            ServerMessage::Error(e) => return Err(anyhow!("stream {}: server error: {}", stream_id, e)),
             _ => {}
         }
     }
