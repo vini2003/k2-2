@@ -73,11 +73,15 @@ pub async fn run_tui(
 
     let mut inflight: Option<JoinHandle<()>> = None;
     loop {
-        terminal.draw(|f| draw_ui(f, &app))?;
+        terminal.draw(|f| draw_ui(f, &mut app))?;
 
         tokio::select! {
             Some(ev) = event_rx.recv() => {
                 if handle_event(ev, &mut app) {
+                    // Abort any in-flight download on exit
+                    if let Some(handle) = inflight.take() {
+                        handle.abort();
+                    }
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -102,6 +106,7 @@ pub async fn run_tui(
                         app.schematics = schematics;
                         app.selected.clear();
                         app.cursor = 0;
+                        app.scroll_offset = 0;
                         app.apply_filter();
                         app.progress = None;
                         app.status = format!("Switched to {}", next_server);
@@ -172,6 +177,7 @@ struct App {
     filtered: Vec<usize>,
     selected: HashSet<usize>,
     cursor: usize,
+    scroll_offset: usize,
     search: String,
     progress: Option<ProgressUpdate>,
     status: String,
@@ -182,6 +188,7 @@ struct App {
     pending_switch: Option<String>,
     last_stats: Option<TransferStats>,
     streams: u32,
+    speed_window: VecDeque<(Instant, u64)>,
 }
 
 struct PendingAction {
@@ -199,16 +206,17 @@ impl App {
             servers: HashMap<String, crate::config::HostConfig>,
             streams: u32,
         ) -> Self {
-            let mut app = Self {
-                server_name,
-                addr,
-                output_dir,
+        let mut app = Self {
+            server_name,
+            addr,
+            output_dir,
             current: ListKind::Worlds,
             worlds,
             schematics,
             filtered: Vec::new(),
             selected: HashSet::new(),
             cursor: 0,
+            scroll_offset: 0,
             search: String::new(),
             progress: None,
             status: "Ready".into(),
@@ -219,6 +227,7 @@ impl App {
             pending_switch: None,
             last_stats: None,
             streams,
+            speed_window: VecDeque::new(),
         };
         app.apply_filter();
         app
@@ -261,11 +270,24 @@ impl App {
     fn move_cursor(&mut self, delta: isize) {
         if self.filtered.is_empty() {
             self.cursor = 0;
+            self.scroll_offset = 0;
             return;
         }
         let len = self.filtered.len() as isize;
         let next = (self.cursor as isize + delta).clamp(0, len - 1);
         self.cursor = next as usize;
+    }
+
+    fn update_scroll(&mut self, visible_height: usize) {
+        if visible_height == 0 {
+            return;
+        }
+        // Keep cursor in view with some padding
+        if self.cursor < self.scroll_offset {
+            self.scroll_offset = self.cursor;
+        } else if self.cursor >= self.scroll_offset + visible_height {
+            self.scroll_offset = self.cursor.saturating_sub(visible_height - 1);
+        }
     }
 
     fn take_action(&mut self) -> Option<PendingAction> {
@@ -289,14 +311,25 @@ impl App {
     fn update_speed(&mut self, p: &ProgressUpdate) {
         if p.phase != ProgressPhase::Sending {
             self.last_progress = None;
+            self.speed_window.clear();
             self.speed = None;
             return;
         }
         let now = Instant::now();
-        if let Some((last_t, last_done)) = self.last_progress {
-            let dt = now.duration_since(last_t).as_secs_f64();
+        self.speed_window.push_back((now, p.done));
+        while let Some((t, _)) = self.speed_window.front() {
+            if now.duration_since(*t).as_secs_f64() > 3.0 {
+                self.speed_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let (Some((old_t, old_bytes)), Some((_, new_bytes))) =
+            (self.speed_window.front(), self.speed_window.back())
+        {
+            let dt = now.duration_since(*old_t).as_secs_f64();
             if dt > 0.0 {
-                let delta = p.done.saturating_sub(last_done) as f64;
+                let delta = new_bytes.saturating_sub(*old_bytes) as f64;
                 let bps = delta / dt;
                 self.speed = Some(format_speed(bps));
             }
@@ -319,7 +352,7 @@ impl App {
     }
 }
 
-fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
+fn draw_ui(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3)].as_ref())
@@ -337,10 +370,15 @@ fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
         .split(chunks[1]);
 
+    let visible_height = body_chunks[0].height.saturating_sub(2) as usize; // Subtract borders
+    app.update_scroll(visible_height);
+
     let items: Vec<ListItem> = app
         .filtered
         .iter()
         .enumerate()
+        .skip(app.scroll_offset)
+        .take(visible_height)
         .map(|(visible_idx, real_idx)| {
             let entry = &app.entries()[*real_idx];
             let selected = app.selected.contains(real_idx);
@@ -360,8 +398,14 @@ fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
         })
         .collect();
 
+    let scroll_indicator = if app.filtered.len() > visible_height {
+        format!(" ({}/{})", app.cursor + 1, app.filtered.len())
+    } else {
+        String::new()
+    };
+
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Items"))
+        .block(Block::default().borders(Borders::ALL).title(format!("Items{}", scroll_indicator)))
         .highlight_style(Style::default().bg(Color::Blue));
     f.render_widget(list, body_chunks[0]);
 
@@ -450,7 +494,7 @@ fn draw_ui(f: &mut ratatui::Frame<'_>, app: &App) {
 
     let footer = Paragraph::new(vec![
         Line::from("Ctrl+j/k or arrows: move  | space: select | /: search | tab: toggle worlds/schematics | Ctrl+s: next server"),
-        Line::from("Actions: 1=world zip  2=region zip  3=schem file  4=schem bundle  q=quit"),
+        Line::from("Download: [1] world zip  [2] region zip  [3] schem file  [4] schem bundle  | Esc/Ctrl+q: quit"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Keys"));
     f.render_widget(footer, chunks[2]);
@@ -480,6 +524,7 @@ fn handle_event(ev: Event, app: &mut App) -> bool {
                         ListKind::Schematics => ListKind::Worlds,
                     };
                     app.cursor = 0;
+                    app.scroll_offset = 0;
                     app.selected.clear();
                     app.apply_filter();
                 }
@@ -494,7 +539,7 @@ fn handle_event(ev: Event, app: &mut App) -> bool {
                 KeyCode::Char('2') => trigger_action(app, DownloadMode::RegionZip),
                 KeyCode::Char('3') => trigger_action(app, DownloadMode::SchematicSingle),
                 KeyCode::Char('4') => trigger_action(app, DownloadMode::SchematicBundle),
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !('1'..='4').contains(&c) => {
                     if c.is_ascii_graphic() || c == ' ' {
                         app.search.push(c);
                         app.apply_filter();

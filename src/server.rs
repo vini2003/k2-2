@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
@@ -36,6 +36,12 @@ pub async fn run_server(name: &str, cfg: HostConfig) -> Result<()> {
 }
 
 async fn handle_client(socket: tokio::net::TcpStream, cfg: HostConfig) -> Result<()> {
+    // TCP performance tuning
+    socket.set_nodelay(true)?;
+    let sock_ref = socket2::SockRef::from(&socket);
+    let _ = sock_ref.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer
+    let _ = sock_ref.set_recv_buffer_size(16 * 1024 * 1024); // 16MB recv buffer
+
     let mut framed = Framed::new(
         socket,
         LengthDelimitedCodec::builder()
@@ -139,7 +145,7 @@ async fn handle_download(
     )
     .await?;
 
-    let mut file = File::open(&built.path)?;
+    let mut file = tokio::fs::File::open(&built.path).await?;
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
     let send_start = std::time::Instant::now();
@@ -150,7 +156,7 @@ async fn handle_download(
     let mut chunks = 0u64;
     loop {
         let t0 = std::time::Instant::now();
-        let n = file.read(&mut buf)?;
+        let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
         let read_ms = t0.elapsed().as_millis();
         read_total += read_ms;
         if read_ms > read_max {
@@ -382,14 +388,14 @@ async fn stream_range(
             .cloned()
             .ok_or_else(|| anyhow!("unknown transfer id"))?
     };
-    let mut file = File::open(&stored.path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    let mut file = tokio::fs::File::open(&stored.path).await?;
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset)).await?;
     let mut remaining = len;
     let mut buf = vec![0u8; CHUNK];
     let mut current = offset;
     while remaining > 0 {
         let to_read = remaining.min(CHUNK as u64) as usize;
-        let n = file.read(&mut buf[..to_read])?;
+        let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf[..to_read]).await?;
         if n == 0 {
             break;
         }

@@ -21,6 +21,13 @@ impl RemoteClient {
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connecting to {addr}"))?;
+
+        // TCP performance tuning
+        stream.set_nodelay(true)?;
+        let sock_ref = socket2::SockRef::from(&stream);
+        let _ = sock_ref.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer
+        let _ = sock_ref.set_recv_buffer_size(16 * 1024 * 1024); // 16MB recv buffer
+
         let mut framed = Framed::new(
             stream,
             LengthDelimitedCodec::builder()
@@ -91,17 +98,20 @@ impl RemoteClient {
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).await.ok();
         }
-        let mut file = fs::File::create(target_path)
-            .await
-            .with_context(|| format!("creating {}", target_path.display()))?;
 
-        send(
-            &mut self.framed,
-            ClientMessage::RequestDownload { entries, mode },
-        )
-        .await?;
+        // Use a closure to handle cleanup on error
+        let result: Result<()> = async {
+            let mut file = fs::File::create(target_path)
+                .await
+                .with_context(|| format!("creating {}", target_path.display()))?;
 
-        while let Some(frame) = self.framed.next().await.transpose()? {
+            send(
+                &mut self.framed,
+                ClientMessage::RequestDownload { entries, mode },
+            )
+            .await?;
+
+            while let Some(frame) = self.framed.next().await.transpose()? {
             let msg: ServerMessage = bincode::deserialize(&frame)?;
             let now = Instant::now();
             let gap = now.duration_since(last_frame).as_millis();
@@ -142,32 +152,40 @@ impl RemoteClient {
                 }
                 ServerMessage::Done => break,
                 ServerMessage::Error(e) => return Err(anyhow!(e)),
-                _ => {}
+                    _ => {}
+                }
             }
+
+            let elapsed = started.elapsed().as_millis();
+            if elapsed > 0 {
+                let secs = (elapsed as f64 / 1000.0).max(0.001);
+                let mbps = (received as f64 / (1024.0 * 1024.0)) / secs;
+                let _ = stats_tx.send(TransferStats {
+                    zip_ms: 0,
+                    send_wall_ms: elapsed,
+                    bytes: received,
+                    avg_mb_s: mbps,
+                    read_ms: 0,
+                    send_ms: 0,
+                    max_read_ms: 0,
+                    max_send_ms: 0,
+                    chunks: 0,
+                    origin: StatsOrigin::Client,
+                    client_write_ms: write_total,
+                    client_max_write_ms: write_max,
+                    client_gap_max_ms: gap_max,
+                });
+            }
+
+            Ok(())
+        }.await;
+
+        // Clean up partial file on error
+        if result.is_err() {
+            let _ = fs::remove_file(target_path).await;
         }
 
-        let elapsed = started.elapsed().as_millis();
-        if elapsed > 0 {
-            let secs = (elapsed as f64 / 1000.0).max(0.001);
-            let mbps = (received as f64 / (1024.0 * 1024.0)) / secs;
-            let _ = stats_tx.send(TransferStats {
-                zip_ms: 0,
-                send_wall_ms: elapsed,
-                bytes: received,
-                avg_mb_s: mbps,
-                read_ms: 0,
-                send_ms: 0,
-                max_read_ms: 0,
-                max_send_ms: 0,
-                chunks: 0,
-                origin: StatsOrigin::Client,
-                client_write_ms: write_total,
-                client_max_write_ms: write_max,
-                client_gap_max_ms: gap_max,
-            });
-        }
-
-        Ok(())
+        result
     }
 
     async fn download_parallel(
@@ -184,15 +202,16 @@ impl RemoteClient {
             fs::create_dir_all(parent).await.ok();
         }
 
-        send(
-            &mut self.framed,
-            ClientMessage::RequestDownloadParallel {
-                entries,
-                mode,
-                streams,
-            },
-        )
-        .await?;
+        let result: Result<()> = async {
+            send(
+                &mut self.framed,
+                ClientMessage::RequestDownloadParallel {
+                    entries,
+                    mode,
+                    streams,
+                },
+            )
+            .await?;
 
         let mut transfer_id = None;
         let mut size = 0u64;
@@ -210,7 +229,7 @@ impl RemoteClient {
         }
         let tid = transfer_id.ok_or_else(|| anyhow!("no transfer id from server"))?;
 
-        let mut out = fs::OpenOptions::new()
+        let out = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
@@ -270,26 +289,34 @@ impl RemoteClient {
             }
         }
 
-        let elapsed = started.elapsed().as_millis();
-        let secs = (elapsed as f64 / 1000.0).max(0.001);
-        let mbps = (size as f64 / (1024.0 * 1024.0)) / secs;
-        let _ = stats_tx.send(TransferStats {
-            zip_ms: 0,
-            send_wall_ms: elapsed,
-            bytes: size,
-            avg_mb_s: mbps,
-            read_ms: 0,
-            send_ms: 0,
-            max_read_ms: 0,
-            max_send_ms: 0,
-            chunks: streams as u64,
-            origin: StatsOrigin::Client,
-            client_write_ms: 0,
-            client_max_write_ms: 0,
-            client_gap_max_ms: 0,
-        });
+            let elapsed = started.elapsed().as_millis();
+            let secs = (elapsed as f64 / 1000.0).max(0.001);
+            let mbps = (size as f64 / (1024.0 * 1024.0)) / secs;
+            let _ = stats_tx.send(TransferStats {
+                zip_ms: 0,
+                send_wall_ms: elapsed,
+                bytes: size,
+                avg_mb_s: mbps,
+                read_ms: 0,
+                send_ms: 0,
+                max_read_ms: 0,
+                max_send_ms: 0,
+                chunks: streams as u64,
+                origin: StatsOrigin::Client,
+                client_write_ms: 0,
+                client_max_write_ms: 0,
+                client_gap_max_ms: 0,
+            });
 
-        Ok(())
+            Ok(())
+        }.await;
+
+        // Clean up partial file on error
+        if result.is_err() {
+            let _ = fs::remove_file(target_path).await;
+        }
+
+        result
     }
 }
 
